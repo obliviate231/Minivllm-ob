@@ -38,6 +38,32 @@ config = {
     'max_model_length': 128,
     'gpu_memory_utilization': 0.9,
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
+
+    # ===== SPECULATIVE DECODING =====
+    # Set `speculative` to True to draft with the small model and verify with
+    # this one. The draft model keeps its own nested config, because the two
+    # models have different shapes and would otherwise collide on keys.
+    'speculative': False,
+    'speculative_gamma': 5,
+    'draft_kv_blocks': 64,
+    'draft_gpu_memory_fraction': 0.15,
+    'speculative_draft_model_config': {
+        'model_name_or_path': 'Qwen/Qwen3-0.6B',
+        'vocab_size': 151936,
+        'hidden_size': 1024,
+        'num_heads': 16,
+        'head_dim': 128,
+        'num_kv_heads': 8,
+        'intermediate_size': 3072,
+        'num_layers': 28,
+        'tie_word_embeddings': True,
+        'base': 1000000,
+        'rms_norm_epsilon': 1e-6,
+        'qkv_bias': False,
+        'scale': 1.0,
+        'max_position': 32768,
+        'ffn_bias': False,
+    },
 }
 
 def main():

@@ -6,9 +6,15 @@ import torch.multiprocessing as mp
 import socket
 import uuid
 
-from myvllm.engine.sequence import Sequence
+from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.engine.scheduler import Scheduler
 from myvllm.engine.model_runner import ModelRunner
+from myvllm.engine.speculative import (
+    DraftModelRunner,
+    SpeculativeStats,
+    spec_decode_config,
+    verify_run,
+)
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.utils.loader import resolve_checkpoint_path
 from transformers import AutoTokenizer
@@ -116,6 +122,20 @@ class LLMEngine:
                 eos=configured_eos,
                 max_model_length=self.config["max_model_length"],
             )
+
+            # SPECULATIVE DECODING: build the draft model once, after the
+            # target model and its KV cache are already resident, so the draft
+            # sizes its own small KV pool from the memory that is actually
+            # left. Only rank 0 drafts and compares; workers stay passive.
+            self.spec_config = spec_decode_config(self.config)
+            self.draft_runner = None
+            self.spec_stats = SpeculativeStats()
+            if self.spec_config is not None:
+                self.draft_runner = DraftModelRunner(self.config, rank=0)
+                print(
+                    "[speculative] draft model ready, gamma = "
+                    f"{self.spec_config['gamma']}"
+                )
         except BaseException:
             self._abort_initialization()
             raise
@@ -187,6 +207,27 @@ class LLMEngine:
         scheduled_sequences, is_prefill = self.scheduler.schedule()
         if not scheduled_sequences:
             return [], 0, is_prefill
+
+        # SPECULATIVE DECODING: on a decode step, try one speculative round
+        # first. It replaces what would have been `1 + accepted` separate
+        # decode steps with a single target pass. Prefill is untouched.
+        if (
+            not is_prefill
+            and self.draft_runner is not None
+            and self.spec_config is not None
+        ):
+            spec = self._spec_step(scheduled_sequences, is_prefill)
+            # `None` means the round was not affordable: fall through to the
+            # ordinary single-token path below.
+            if spec is not None:
+                spec_seqs, accepted = spec
+                emitted = sum(a + 1 for a in accepted)
+                outputs = [
+                    (seq.seq_id, seq.completion_token_ids)
+                    for seq in spec_seqs
+                    if seq.is_finished
+                ]
+                return outputs, emitted, False
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
         # Move outputs to CPU and convert them to a list
@@ -216,6 +257,20 @@ class LLMEngine:
         self.model_runner.call("reset_peak_memory_stats")
         self.scheduler.block_manager.reset_peak_num_used_blocks()
 
+    def get_speculative_stats(self) -> dict | None:
+        """Speculative-decoding counters, or None when it is disabled."""
+        if self.draft_runner is None:
+            return None
+        stats = self.spec_stats.as_dict()
+        stats["gamma"] = self.spec_config["gamma"]
+        stats["draft_model"] = self.config["speculative_draft_model_config"][
+            "model_name_or_path"
+        ]
+        return stats
+
+    def reset_speculative_stats(self) -> None:
+        self.spec_stats = SpeculativeStats()
+
     def get_benchmark_memory_metrics(self) -> dict:
         """Collect per-rank CUDA metrics and rank-0 KV-block usage."""
         block_manager = self.scheduler.block_manager
@@ -228,11 +283,142 @@ class LLMEngine:
             "block_size_tokens": block_manager.block_size,
         }
 
+    # ------------------------------------------------------------------
+    # SPECULATIVE DECODING
+    #
+    # The accept step is the whole trick, and it is three lines because of an
+    # invariant the engine already maintains: `seq.last_token` is exactly the
+    # token whose K/V is in the last occupied cache slot. So a run that starts
+    # at `last_token` can be verified against the existing cache with no KV
+    # write and no block allocation -- the run's first K/V is the one already
+    # there. We accept the leading draft tokens the target agrees with, then
+    # append the bonus token, which the target produced itself and is
+    # therefore exact. The run's last token is deliberately re-decoded by the
+    # next normal step (one extra pass per round) to keep that invariant true.
+
+    def _spec_step(
+        self, seqs: list["Sequence"], is_prefill: bool
+    ) -> tuple[list["Sequence"], list[int]] | None:
+        """One speculative round for a decode batch.
+
+        Returns the sequences that appended tokens and one representative new
+        token each (used only for progress reporting), or None when the round
+        cannot be afforded and the caller should fall back to a normal
+        single-token decode. Token counts differ per sequence, which is fine:
+        nothing downstream requires exactly one token per sequence per step.
+
+        A round appends up to `gamma + 1` tokens, so it needs up to that many
+        free blocks per sequence. We only run it when the batch can afford it.
+        """
+        gamma = self.spec_config["gamma"]
+        blocks_per_round = (gamma + 1) // self.scheduler.block_manager.block_size + 1
+        if len(self.scheduler.block_manager.free_block_ids) < blocks_per_round * len(seqs):
+            return None
+
+        drafts = self.draft_runner.propose(
+            [seq.last_token for seq in seqs], self.spec_config["gamma"]
+        )
+        self.spec_stats.rounds += 1
+        self.spec_stats.draft_forwards += self.spec_config["gamma"]
+        self.spec_stats.draft_tokens += sum(len(d) for d in drafts)
+
+        # The run's tokens must exist on the sequence *before* verification, so
+        # that the block table covers every slot the run writes. Allocate for
+        # the full run now (`1 + gamma` tokens); the accepted prefix is what
+        # survives, and anything past it is released below.
+        run_heads = {}
+        run_lens = {}
+        for seq, draft_tokens in zip(seqs, drafts):
+            if not draft_tokens:
+                continue
+            # The run head is the token the sequence already ended on; its K/V
+            # is the last entry the cache holds, and the draft tokens continue
+            # from it. Capture it before appending, because appending moves
+            # `last_token` forward.
+            run_heads[seq.seq_id] = seq.last_token
+            run_lens[seq.seq_id] = 1 + len(draft_tokens)
+            for token in list(draft_tokens):
+                seq.append_token(token)
+                self.scheduler.block_manager.append(seq)
+
+        # ONE target forward verifies every sequence's whole run.
+        self.model_runner.call(
+            "run_verify",
+            seqs,
+            drafts,
+            [run_heads[s.seq_id] for s in seqs],
+            [run_lens[s.seq_id] for s in seqs],
+        )
+        self.spec_stats.target_forwards += 1
+        logits_per_seq = self.model_runner.verify_logits
+
+        scheduled: list["Sequence"] = []
+        progress: list[int] = []
+        for seq, draft_tokens, logits in zip(seqs, drafts, logits_per_seq):
+            if not draft_tokens:
+                continue
+            run = verify_run(logits, draft_tokens)
+            # Only `run.accepted` of the appended draft tokens are real
+            # output; the rest were speculative and must go. The target's own
+            # bonus token is then appended in their place.
+            drop = len(draft_tokens) - run.accepted
+            self._truncate_run(seq, self.scheduler.block_manager, drop)
+            seq.append_token(run.bonus)
+            self.scheduler.block_manager.append(seq)
+            self.spec_stats.accepted_tokens += run.accepted
+            self.spec_stats.tokens_emitted += run.accepted + 1
+            scheduled.append(seq)
+            progress.append(run.accepted)
+
+        # Stop conditions are the scheduler's job; re-check them here because
+        # a speculative round can append several tokens at once and overshoot
+        # max_tokens / max_model_length if we waited for the next postprocess.
+        for seq in scheduled:
+            if (
+                seq.num_completion_tokens >= seq.max_tokens
+                or (
+                    seq.max_model_length is not None
+                    and seq.num_tokens >= seq.max_model_length
+                )
+                or (not seq.ignore_eos and seq.last_token == self.config["eos"])
+            ):
+                seq.status = SequenceStatus.FINISHED
+                self.scheduler.block_manager.deallocate(seq)
+                if seq in self.scheduler.running:
+                    self.scheduler.running.remove(seq)
+
+        return scheduled, progress
+
+    def _truncate_run(self, seq, block_manager, drop: int) -> None:
+        """Drop the last `drop` tokens of a speculative run, freeing blocks.
+
+        The full draft run is appended before verification so the block table
+        covers every slot the verify pass writes. Once the accepted prefix is
+        known the unaccepted tail is cut, and any block that no longer holds a
+        surviving token returns to the pool.
+        """
+        if drop <= 0:
+            return
+        del seq.token_ids[-drop:]
+        seq.num_tokens -= drop
+        seq.last_token = seq.token_ids[-1]
+        while len(seq.block_table) > seq.num_blocks:
+            block_id = seq.block_table.pop()
+            block = block_manager.blocks[block_id]
+            if block.ref_count > 0:
+                block.ref_count -= 1
+            if block.ref_count == 0:
+                block_manager.used_block_ids.discard(block_id)
+                if block_id not in block_manager.free_block_ids:
+                    block_manager.free_block_ids.append(block_id)
+
     # given a list of prompts
     # add_prompt for each prompt
     # call step until all sequences are finished
     # return the generated texts
     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> dict[str, list]:
+        # Each call is one measured workload; start its counters at zero.
+        self.reset_speculative_stats()
         for prompt in prompts:
             self.add_prompt(prompt, sampling_params)
         generated_tokens = {}

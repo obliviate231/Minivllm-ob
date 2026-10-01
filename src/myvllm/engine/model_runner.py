@@ -106,6 +106,11 @@ class ModelRunner:
 
         self.sampler = SamplerLayer()
 
+        # SPECULATIVE DECODING: per-sequence logits from the last
+        # `run_verify` call, one tensor per sequence covering
+        # `[last_token, *draft_tokens]`.
+        self.verify_logits = None
+
         # Debug flag for first decode step
         self._first_decode = False
 
@@ -364,6 +369,128 @@ class ModelRunner:
         all_metrics = [None] * self.world_size
         dist.all_gather_object(all_metrics, local_metrics)
         return all_metrics if self.rank == 0 else None
+
+    # ------------------------------------------------------------------
+    # SPECULATIVE DECODING: verify a whole batch of draft runs in ONE pass.
+    #
+    # A run for sequence `s` is `[last_token, *draft_tokens]`, and its first
+    # token is exactly the token whose K/V already occupies cache slot
+    # `len(seq) - 1` (the engine maintains that invariant on every decode
+    # step). Verification therefore writes NO KV -- `slot_mapping` is all -1 --
+    # and allocates no blocks; the existing cache is read as-is.
+    #
+    # Alignment is the whole difficulty, and `cu_seqlens_k - cu_seqlens_q` is
+    # what solves it: the flash kernel calls that difference
+    # `num_cached_tokens` and its causal test is
+    # `(num_cached + offs_m) >= offs_n` over cache positions. A query at run
+    # offset `m` must see cache positions `0 .. len(seq) - 1 + m`, so
+    # `num_cached` must be `len(seq) - 1` for every row of that sequence --
+    # independent of the run length. Prefill-shaped metadata is used because
+    # the run has `1 + gamma` tokens per sequence while the decode path assumes
+    # exactly one token per sequence.
+    @torch.inference_mode()
+    def run_verify(
+        self,
+        seqs: list[Sequence],
+        draft_runs: list[list[int]],
+        run_heads: list[int] | None = None,
+        run_lens: list[int] | None = None,
+    ) -> None:
+        """Verify one draft run per sequence in ONE target forward pass.
+
+        `run_heads[s]` is the token the run starts from -- the sequence's last
+        token *before* the run was appended -- and `run_lens[s]` is the run's
+        length including that head. Both are supplied by the caller because by
+        the time this runs the tokens are already on the sequence and
+        `last_token` points at the run's tail.
+        """
+        import torch
+
+        from myvllm.utils import reset_context, set_context
+
+        if run_heads is None:
+            run_heads = [seq.last_token for seq in seqs]
+        if run_lens is None:
+            run_lens = [1 + len(run) for run in draft_runs]
+
+        total = sum(run_lens)
+        if total == 0:
+            self.verify_logits = []
+            return
+        device = f'cuda:{self.rank}'
+        input_ids = torch.empty(total, dtype=torch.long, device=device)
+        row = 0
+        for head, run, run_len in zip(run_heads, draft_runs, run_lens):
+            input_ids[row] = head
+            row += 1
+            for token in run[: run_len - 1]:
+                input_ids[row] = token
+                row += 1
+        cu_seqlens_q = torch.zeros(len(seqs) + 1, dtype=torch.int32, device=device)
+        cu_seqlens_q[1:] = torch.tensor(
+            run_lens, dtype=torch.int32, device=device
+        ).cumsum(0)
+        # `pre_run_len` is how many tokens the cache held before this round.
+        pre_run_lens = [seq.num_tokens - run_len for seq, run_len in zip(seqs, run_lens)]
+        # The run's tokens occupy cache positions `pre .. pre + run_len - 1`,
+        # because the head token's K/V is written by THIS pass at slot `pre`.
+        # `num_cached` must therefore be `pre` so that the causal test lines up
+        # query offset `m` with cache position `pre + m`.
+        cu_seqlens_k = cu_seqlens_q.clone()
+        cu_seqlens_k[1:] = cu_seqlens_q[1:] + torch.tensor(
+            [max(0, pre) for pre in pre_run_lens],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        max_num_blocks = max(len(seq.block_table) for seq in seqs)
+        block_tables = torch.tensor(
+            [
+                seq.block_table + [-1] * (max_num_blocks - len(seq.block_table))
+                for seq in seqs
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        # Write the run's own K/V so the cache stays consistent with the
+        # tokens the run feeds in. The caller has already allocated the blocks
+        # the run will occupy, so every slot we name exists.
+        slot_mapping = []
+        for seq, run_len, pre in zip(seqs, run_lens, pre_run_lens):
+            for offset in range(run_len):
+                position = pre + offset
+                block_index = position // self.block_size
+                slot_mapping.append(
+                    seq.block_table[block_index] * self.block_size
+                    + position % self.block_size
+                )
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.long, device=device)
+
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(run_lens),
+            max_seqlen_k=max(
+                run_len + max(0, pre) for run_len, pre in zip(run_lens, pre_run_lens)
+            ),
+            slot_mapping=slot_mapping,
+            context_lens=None,
+            block_tables=block_tables,
+        )
+        try:
+            hidden_states = self.model(input_ids)
+        finally:
+            reset_context()
+
+        # Row `i` of a run holds the distribution for the token after run token
+        # `i`, which is what the greedy accept rule compares against. rank != 0
+        # keeps no logits; the accept decision lives on rank 0.
+        if self.rank == 0:
+            all_logits = self.model.compute_logits_all_rows(hidden_states)
+            self.verify_logits = list(torch.split(all_logits, run_lens, dim=0))
+        else:
+            self.verify_logits = None
 
     # given seqs
     # prepare the data needed for a prefill forward pass

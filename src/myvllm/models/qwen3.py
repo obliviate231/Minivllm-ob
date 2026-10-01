@@ -372,6 +372,16 @@ class Qwen3ForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states)
         return logits
 
+    def compute_logits_all_rows(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Logits for EVERY row, bypassing the prefill last-token selection.
+
+        `compute_logits` returns one row per sequence because speculating on a
+        normal prefill only wants the last token's distribution. Verification
+        needs every position's distribution, so it projects the hidden states
+        directly instead.
+        """
+        return torch.nn.functional.linear(hidden_states, self.lm_head.weight)
+
 if __name__ == "__main__":
     model = Qwen3ForCausalLM(
         vocab_size=50257,

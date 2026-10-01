@@ -1,0 +1,38 @@
+{
+  "target_model": "/home/ob/infra/huggingface/local/Qwen3-0.6B",
+  "draft_model": "/home/ob/infra/huggingface/local/Qwen3-0.6B",
+  "gamma": 4,
+  "max_tokens": 96,
+  "num_prompts": 4,
+  "temperature": 1e-05,
+  "baseline": {
+    "name": "baseline",
+    "latency_s": 6.942749221001577,
+    "tokens": 384,
+    "tokens_per_s": 55.309501722806466,
+    "latency_per_token_ms": 18.080076096358273
+  },
+  "speculative": {
+    "name": "speculative",
+    "latency_s": 46.435685062999255,
+    "tokens": 384,
+    "tokens_per_s": 8.26950220458743,
+    "latency_per_token_ms": 120.9262631848939,
+    "speculative": {
+      "rounds": 95,
+      "draft_tokens": 1512,
+      "accepted_tokens": 2,
+      "acceptance_rate": 0.0013227513227513227,
+      "mean_accepted_per_round": 0.021052631578947368,
+      "target_forwards": 95,
+      "target_forwards_per_token": 0.25,
+      "tokens_emitted": 380,
+      "draft_forwards": 380,
+      "gamma": 4,
+      "draft_model": "/home/ob/infra/huggingface/local/Qwen3-0.6B"
+    }
+  },
+  "speedup_tokens_per_s": 0.14951322913794327,
+  "baseline_latency_per_token_ms": 18.080076096358273,
+  "speculative_latency_per_token_ms": 120.9262631848939
+}
