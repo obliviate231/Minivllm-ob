@@ -1,0 +1,1354 @@
+diff --git a/main.py b/main.py
+index 279eca9..e997ab1 100644
+--- a/main.py
++++ b/main.py
+@@ -38,6 +38,32 @@ config = {
+     'max_model_length': 128,
+     'gpu_memory_utilization': 0.9,
+     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
++
++    # ===== SPECULATIVE DECODING =====
++    # Set `speculative` to True to draft with the small model and verify with
++    # this one. The draft model keeps its own nested config, because the two
++    # models have different shapes and would otherwise collide on keys.
++    'speculative': False,
++    'speculative_gamma': 5,
++    'draft_kv_blocks': 64,
++    'draft_gpu_memory_fraction': 0.15,
++    'speculative_draft_model_config': {
++        'model_name_or_path': 'Qwen/Qwen3-0.6B',
++        'vocab_size': 151936,
++        'hidden_size': 1024,
++        'num_heads': 16,
++        'head_dim': 128,
++        'num_kv_heads': 8,
++        'intermediate_size': 3072,
++        'num_layers': 28,
++        'tie_word_embeddings': True,
++        'base': 1000000,
++        'rms_norm_epsilon': 1e-6,
++        'qkv_bias': False,
++        'scale': 1.0,
++        'max_position': 32768,
++        'ffn_bias': False,
++    },
+ }
+ 
+ def main():
+diff --git a/src/myvllm/engine/llm_engine.py b/src/myvllm/engine/llm_engine.py
+index 3d02665..7446dea 100644
+--- a/src/myvllm/engine/llm_engine.py
++++ b/src/myvllm/engine/llm_engine.py
+@@ -6,9 +6,15 @@ import torch.multiprocessing as mp
+ import socket
+ import uuid
+ 
+-from myvllm.engine.sequence import Sequence
++from myvllm.engine.sequence import Sequence, SequenceStatus
+ from myvllm.engine.scheduler import Scheduler
+ from myvllm.engine.model_runner import ModelRunner
++from myvllm.engine.speculative import (
++    DraftModelRunner,
++    SpeculativeStats,
++    spec_decode_config,
++    verify_run,
++)
+ from myvllm.sampling_parameters import SamplingParams
+ from myvllm.utils.loader import resolve_checkpoint_path
+ from transformers import AutoTokenizer
+@@ -116,6 +122,20 @@ class LLMEngine:
+                 eos=configured_eos,
+                 max_model_length=self.config["max_model_length"],
+             )
++
++            # SPECULATIVE DECODING: build the draft model once, after the
++            # target model and its KV cache are already resident, so the draft
++            # sizes its own small KV pool from the memory that is actually
++            # left. Only rank 0 drafts and compares; workers stay passive.
++            self.spec_config = spec_decode_config(self.config)
++            self.draft_runner = None
++            self.spec_stats = SpeculativeStats()
++            if self.spec_config is not None:
++                self.draft_runner = DraftModelRunner(self.config, rank=0)
++                print(
++                    "[speculative] draft model ready, gamma = "
++                    f"{self.spec_config['gamma']}"
++                )
+         except BaseException:
+             self._abort_initialization()
+             raise
+@@ -187,6 +207,27 @@ class LLMEngine:
+         scheduled_sequences, is_prefill = self.scheduler.schedule()
+         if not scheduled_sequences:
+             return [], 0, is_prefill
++
++        # SPECULATIVE DECODING: on a decode step, try one speculative round
++        # first. It replaces what would have been `1 + accepted` separate
++        # decode steps with a single target pass. Prefill is untouched.
++        if (
++            not is_prefill
++            and self.draft_runner is not None
++            and self.spec_config is not None
++        ):
++            spec = self._spec_step(scheduled_sequences, is_prefill)
++            # `None` means the round was not affordable: fall through to the
++            # ordinary single-token path below.
++            if spec is not None:
++                spec_seqs, accepted = spec
++                emitted = sum(a + 1 for a in accepted)
++                outputs = [
++                    (seq.seq_id, seq.completion_token_ids)
++                    for seq in spec_seqs
++                    if seq.is_finished
++                ]
++                return outputs, emitted, False
+         # run the model
+         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+         # Move outputs to CPU and convert them to a list
+@@ -216,6 +257,20 @@ class LLMEngine:
+         self.model_runner.call("reset_peak_memory_stats")
+         self.scheduler.block_manager.reset_peak_num_used_blocks()
+ 
++    def get_speculative_stats(self) -> dict | None:
++        """Speculative-decoding counters, or None when it is disabled."""
++        if self.draft_runner is None:
++            return None
++        stats = self.spec_stats.as_dict()
++        stats["gamma"] = self.spec_config["gamma"]
++        stats["draft_model"] = self.config["speculative_draft_model_config"][
++            "model_name_or_path"
++        ]
++        return stats
++
++    def reset_speculative_stats(self) -> None:
++        self.spec_stats = SpeculativeStats()
++
+     def get_benchmark_memory_metrics(self) -> dict:
+         """Collect per-rank CUDA metrics and rank-0 KV-block usage."""
+         block_manager = self.scheduler.block_manager
+@@ -228,11 +283,142 @@ class LLMEngine:
+             "block_size_tokens": block_manager.block_size,
+         }
+ 
++    # ------------------------------------------------------------------
++    # SPECULATIVE DECODING
++    #
++    # The accept step is the whole trick, and it is three lines because of an
++    # invariant the engine already maintains: `seq.last_token` is exactly the
++    # token whose K/V is in the last occupied cache slot. So a run that starts
++    # at `last_token` can be verified against the existing cache with no KV
++    # write and no block allocation -- the run's first K/V is the one already
++    # there. We accept the leading draft tokens the target agrees with, then
++    # append the bonus token, which the target produced itself and is
++    # therefore exact. The run's last token is deliberately re-decoded by the
++    # next normal step (one extra pass per round) to keep that invariant true.
++
++    def _spec_step(
++        self, seqs: list["Sequence"], is_prefill: bool
++    ) -> tuple[list["Sequence"], list[int]] | None:
++        """One speculative round for a decode batch.
++
++        Returns the sequences that appended tokens and one representative new
++        token each (used only for progress reporting), or None when the round
++        cannot be afforded and the caller should fall back to a normal
++        single-token decode. Token counts differ per sequence, which is fine:
++        nothing downstream requires exactly one token per sequence per step.
++
++        A round appends up to `gamma + 1` tokens, so it needs up to that many
++        free blocks per sequence. We only run it when the batch can afford it.
++        """
++        gamma = self.spec_config["gamma"]
++        blocks_per_round = (gamma + 1) // self.scheduler.block_manager.block_size + 1
++        if len(self.scheduler.block_manager.free_block_ids) < blocks_per_round * len(seqs):
++            return None
++
++        drafts = self.draft_runner.propose(
++            [seq.last_token for seq in seqs], self.spec_config["gamma"]
++        )
++        self.spec_stats.rounds += 1
++        self.spec_stats.draft_forwards += self.spec_config["gamma"]
++        self.spec_stats.draft_tokens += sum(len(d) for d in drafts)
++
++        # The run's tokens must exist on the sequence *before* verification, so
++        # that the block table covers every slot the run writes. Allocate for
++        # the full run now (`1 + gamma` tokens); the accepted prefix is what
++        # survives, and anything past it is released below.
++        run_heads = {}
++        run_lens = {}
++        for seq, draft_tokens in zip(seqs, drafts):
++            if not draft_tokens:
++                continue
++            # The run head is the token the sequence already ended on; its K/V
++            # is the last entry the cache holds, and the draft tokens continue
++            # from it. Capture it before appending, because appending moves
++            # `last_token` forward.
++            run_heads[seq.seq_id] = seq.last_token
++            run_lens[seq.seq_id] = 1 + len(draft_tokens)
++            for token in list(draft_tokens):
++                seq.append_token(token)
++                self.scheduler.block_manager.append(seq)
++
++        # ONE target forward verifies every sequence's whole run.
++        self.model_runner.call(
++            "run_verify",
++            seqs,
++            drafts,
++            [run_heads[s.seq_id] for s in seqs],
++            [run_lens[s.seq_id] for s in seqs],
++        )
++        self.spec_stats.target_forwards += 1
++        logits_per_seq = self.model_runner.verify_logits
++
++        scheduled: list["Sequence"] = []
++        progress: list[int] = []
++        for seq, draft_tokens, logits in zip(seqs, drafts, logits_per_seq):
++            if not draft_tokens:
++                continue
++            run = verify_run(logits, draft_tokens)
++            # Only `run.accepted` of the appended draft tokens are real
++            # output; the rest were speculative and must go. The target's own
++            # bonus token is then appended in their place.
++            drop = len(draft_tokens) - run.accepted
++            self._truncate_run(seq, self.scheduler.block_manager, drop)
++            seq.append_token(run.bonus)
++            self.scheduler.block_manager.append(seq)
++            self.spec_stats.accepted_tokens += run.accepted
++            self.spec_stats.tokens_emitted += run.accepted + 1
++            scheduled.append(seq)
++            progress.append(run.accepted)
++
++        # Stop conditions are the scheduler's job; re-check them here because
++        # a speculative round can append several tokens at once and overshoot
++        # max_tokens / max_model_length if we waited for the next postprocess.
++        for seq in scheduled:
++            if (
++                seq.num_completion_tokens >= seq.max_tokens
++                or (
++                    seq.max_model_length is not None
++                    and seq.num_tokens >= seq.max_model_length
++                )
++                or (not seq.ignore_eos and seq.last_token == self.config["eos"])
++            ):
++                seq.status = SequenceStatus.FINISHED
++                self.scheduler.block_manager.deallocate(seq)
++                if seq in self.scheduler.running:
++                    self.scheduler.running.remove(seq)
++
++        return scheduled, progress
++
++    def _truncate_run(self, seq, block_manager, drop: int) -> None:
++        """Drop the last `drop` tokens of a speculative run, freeing blocks.
++
++        The full draft run is appended before verification so the block table
++        covers every slot the verify pass writes. Once the accepted prefix is
++        known the unaccepted tail is cut, and any block that no longer holds a
++        surviving token returns to the pool.
++        """
++        if drop <= 0:
++            return
++        del seq.token_ids[-drop:]
++        seq.num_tokens -= drop
++        seq.last_token = seq.token_ids[-1]
++        while len(seq.block_table) > seq.num_blocks:
++            block_id = seq.block_table.pop()
++            block = block_manager.blocks[block_id]
++            if block.ref_count > 0:
++                block.ref_count -= 1
++            if block.ref_count == 0:
++                block_manager.used_block_ids.discard(block_id)
++                if block_id not in block_manager.free_block_ids:
++                    block_manager.free_block_ids.append(block_id)
++
+     # given a list of prompts
+     # add_prompt for each prompt
+     # call step until all sequences are finished
+     # return the generated texts
+     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> dict[str, list]:
++        # Each call is one measured workload; start its counters at zero.
++        self.reset_speculative_stats()
+         for prompt in prompts:
+             self.add_prompt(prompt, sampling_params)
+         generated_tokens = {}
+diff --git a/src/myvllm/engine/model_runner.py b/src/myvllm/engine/model_runner.py
+index 13d098c..90a93c3 100644
+--- a/src/myvllm/engine/model_runner.py
++++ b/src/myvllm/engine/model_runner.py
+@@ -106,6 +106,11 @@ class ModelRunner:
+ 
+         self.sampler = SamplerLayer()
+ 
++        # SPECULATIVE DECODING: per-sequence logits from the last
++        # `run_verify` call, one tensor per sequence covering
++        # `[last_token, *draft_tokens]`.
++        self.verify_logits = None
++
+         # Debug flag for first decode step
+         self._first_decode = False
+ 
+@@ -365,6 +370,128 @@ class ModelRunner:
+         dist.all_gather_object(all_metrics, local_metrics)
+         return all_metrics if self.rank == 0 else None
+ 
++    # ------------------------------------------------------------------
++    # SPECULATIVE DECODING: verify a whole batch of draft runs in ONE pass.
++    #
++    # A run for sequence `s` is `[last_token, *draft_tokens]`, and its first
++    # token is exactly the token whose K/V already occupies cache slot
++    # `len(seq) - 1` (the engine maintains that invariant on every decode
++    # step). Verification therefore writes NO KV -- `slot_mapping` is all -1 --
++    # and allocates no blocks; the existing cache is read as-is.
++    #
++    # Alignment is the whole difficulty, and `cu_seqlens_k - cu_seqlens_q` is
++    # what solves it: the flash kernel calls that difference
++    # `num_cached_tokens` and its causal test is
++    # `(num_cached + offs_m) >= offs_n` over cache positions. A query at run
++    # offset `m` must see cache positions `0 .. len(seq) - 1 + m`, so
++    # `num_cached` must be `len(seq) - 1` for every row of that sequence --
++    # independent of the run length. Prefill-shaped metadata is used because
++    # the run has `1 + gamma` tokens per sequence while the decode path assumes
++    # exactly one token per sequence.
++    @torch.inference_mode()
++    def run_verify(
++        self,
++        seqs: list[Sequence],
++        draft_runs: list[list[int]],
++        run_heads: list[int] | None = None,
++        run_lens: list[int] | None = None,
++    ) -> None:
++        """Verify one draft run per sequence in ONE target forward pass.
++
++        `run_heads[s]` is the token the run starts from -- the sequence's last
++        token *before* the run was appended -- and `run_lens[s]` is the run's
++        length including that head. Both are supplied by the caller because by
++        the time this runs the tokens are already on the sequence and
++        `last_token` points at the run's tail.
++        """
++        import torch
++
++        from myvllm.utils import reset_context, set_context
++
++        if run_heads is None:
++            run_heads = [seq.last_token for seq in seqs]
++        if run_lens is None:
++            run_lens = [1 + len(run) for run in draft_runs]
++
++        total = sum(run_lens)
++        if total == 0:
++            self.verify_logits = []
++            return
++        device = f'cuda:{self.rank}'
++        input_ids = torch.empty(total, dtype=torch.long, device=device)
++        row = 0
++        for head, run, run_len in zip(run_heads, draft_runs, run_lens):
++            input_ids[row] = head
++            row += 1
++            for token in run[: run_len - 1]:
++                input_ids[row] = token
++                row += 1
++        cu_seqlens_q = torch.zeros(len(seqs) + 1, dtype=torch.int32, device=device)
++        cu_seqlens_q[1:] = torch.tensor(
++            run_lens, dtype=torch.int32, device=device
++        ).cumsum(0)
++        # `pre_run_len` is how many tokens the cache held before this round.
++        pre_run_lens = [seq.num_tokens - run_len for seq, run_len in zip(seqs, run_lens)]
++        # The run's tokens occupy cache positions `pre .. pre + run_len - 1`,
++        # because the head token's K/V is written by THIS pass at slot `pre`.
++        # `num_cached` must therefore be `pre` so that the causal test lines up
++        # query offset `m` with cache position `pre + m`.
++        cu_seqlens_k = cu_seqlens_q.clone()
++        cu_seqlens_k[1:] = cu_seqlens_q[1:] + torch.tensor(
++            [max(0, pre) for pre in pre_run_lens],
++            dtype=torch.int32,
++            device=device,
++        )
++
++        max_num_blocks = max(len(seq.block_table) for seq in seqs)
++        block_tables = torch.tensor(
++            [
++                seq.block_table + [-1] * (max_num_blocks - len(seq.block_table))
++                for seq in seqs
++            ],
++            dtype=torch.int32,
++            device=device,
++        )
++        # Write the run's own K/V so the cache stays consistent with the
++        # tokens the run feeds in. The caller has already allocated the blocks
++        # the run will occupy, so every slot we name exists.
++        slot_mapping = []
++        for seq, run_len, pre in zip(seqs, run_lens, pre_run_lens):
++            for offset in range(run_len):
++                position = pre + offset
++                block_index = position // self.block_size
++                slot_mapping.append(
++                    seq.block_table[block_index] * self.block_size
++                    + position % self.block_size
++                )
++        slot_mapping = torch.tensor(slot_mapping, dtype=torch.long, device=device)
++
++        set_context(
++            is_prefill=True,
++            cu_seqlens_q=cu_seqlens_q,
++            cu_seqlens_k=cu_seqlens_k,
++            max_seqlen_q=max(run_lens),
++            max_seqlen_k=max(
++                run_len + max(0, pre) for run_len, pre in zip(run_lens, pre_run_lens)
++            ),
++            slot_mapping=slot_mapping,
++            context_lens=None,
++            block_tables=block_tables,
++        )
++        try:
++            hidden_states = self.model(input_ids)
++        finally:
++            reset_context()
++
++        # Row `i` of a run holds the distribution for the token after run token
++        # `i`, which is what the greedy accept rule compares against. rank != 0
++        # keeps no logits; the accept decision lives on rank 0.
++        if self.rank == 0:
++            all_logits = self.model.compute_logits_all_rows(hidden_states)
++            self.verify_logits = list(torch.split(all_logits, run_lens, dim=0))
++        else:
++            self.verify_logits = None
++
+     # given seqs
+     # prepare the data needed for a prefill forward pass
+     # taking prefix cache into consideration: 
+diff --git a/src/myvllm/engine/speculative.py b/src/myvllm/engine/speculative.py
+new file mode 100644
+index 0000000..ee092c3
+--- /dev/null
++++ b/src/myvllm/engine/speculative.py
+@@ -0,0 +1,395 @@
++"""Draft-model speculative decoding for MiniVLLM (the simple version).
++
++The idea in one paragraph: a small draft model proposes `gamma` tokens; the
++big target model then verifies all of them in a *single* forward pass instead
++of `gamma + 1` passes. Every verified token is therefore free -- it was
++already paid for by the one pass -- so the decode loop advances by as many
++tokens as were accepted. We use plain greedy sampling, which makes the accept
++rule exact and trivial: a draft token is accepted iff the target model's
++argmax points at it. No rejection-sampling correction is needed, because for
++greedy decoding the accepted prefix's distribution *is* the target's.
++
++Why this fits MiniVLLM unchanged:
++
++  * the sequence's paged KV cache covers positions `0 .. L-1`, where `L-1` is
++    the current last token. Verification of a run that *starts* at that last
++    token therefore needs no KV write and no block allocation at all -- the
++    last token's K/V is reused as the run's first K/V. That is why the accept
++    path below is a few lines rather than a rewrite of `BlockManager`.
++  * the draft proposal reuses the same verify path on the *draft* model, with
++    its own private KV slots. The target's cache is untouched by drafting.
++
++Trade-off: after acceptance we re-decode the run's last token in the
++following step (one extra pass per round) so that "last token <-> cached K/V"
++stays an invariant of the engine. With `gamma=5` and a realistic acceptance
++rate that redundancy is a fraction of one pass, and it buys a two-method
++change instead of a scheduler rewrite.
++"""
++
++from dataclasses import dataclass
++
++import torch
++
++from myvllm.engine.sequence import Sequence
++from myvllm.sampling_parameters import SamplingParams
++
++
++@dataclass
++class SpeculativeStats:
++    """Bookkeeping for one speculative-decoding workload.
++
++    `draft_tokens` / `accepted_tokens` describe the draft model's quality;
++    `target_forwards` vs `tokens_emitted` describes what it bought us. Plain
++    decoding needs one target forward per emitted token, so that ratio is the
++    speedup we should see, before paying for the draft model.
++    """
++
++    rounds: int = 0
++    draft_tokens: int = 0
++    accepted_tokens: int = 0
++    target_forwards: int = 0
++    tokens_emitted: int = 0
++    draft_forwards: int = 0
++
++    @property
++    def acceptance_rate(self) -> float:
++        return (
++            self.accepted_tokens / self.draft_tokens if self.draft_tokens else 0.0
++        )
++
++    @property
++    def mean_accepted_per_round(self) -> float:
++        return self.accepted_tokens / self.rounds if self.rounds else 0.0
++
++    @property
++    def target_forwards_per_token(self) -> float:
++        return (
++            self.target_forwards / self.tokens_emitted
++            if self.tokens_emitted
++            else 0.0
++        )
++
++    def merge(self, other: "SpeculativeStats") -> None:
++        self.rounds += other.rounds
++        self.draft_tokens += other.draft_tokens
++        self.accepted_tokens += other.accepted_tokens
++        self.target_forwards += other.target_forwards
++        self.tokens_emitted += other.tokens_emitted
++        self.draft_forwards += other.draft_forwards
++
++    def as_dict(self) -> dict:
++        return {
++            "rounds": self.rounds,
++            "draft_tokens": self.draft_tokens,
++            "accepted_tokens": self.accepted_tokens,
++            "acceptance_rate": self.acceptance_rate,
++            "mean_accepted_per_round": self.mean_accepted_per_round,
++            "target_forwards": self.target_forwards,
++            "target_forwards_per_token": self.target_forwards_per_token,
++            "tokens_emitted": self.tokens_emitted,
++            "draft_forwards": self.draft_forwards,
++        }
++
++
++@dataclass
++class VerifyRun:
++    """One speculative round's outcome for a single sequence.
++
++    `verified` are the draft tokens the target confirmed, in order. `bonus` is
++    the target's own next token at the first disagreement, which is exact by
++    construction -- so a round always yields at least one new token, even when
++    the draft model is wrong on its very first proposal.
++    """
++
++    verified: list[int]
++    bonus: int
++
++    @property
++    def accepted(self) -> int:
++        return len(self.verified)
++
++
++def _restore_context(saved) -> None:
++    """Put a previously captured Context back as the engine's global context.
++
++    The draft pass overwrites the process-wide context; the target's verify
++    pass and the rest of the engine step depend on the context the engine had
++    already built, so it must be restored rather than cleared.
++    """
++    import myvllm.utils.context as context_module
++
++    context_module._context = saved
++
++
++def verify_run(target_logits: torch.Tensor, draft_tokens: list[int]) -> VerifyRun:
++    """Greedy accept rule: keep the leading draft tokens the target agrees with.
++
++    `target_logits` has one row per position of `[last_token, *draft_tokens]`.
++    Row `i` predicts the token at index `i + 1`, so the token the target would
++    have produced for index `i + 1` is `argmax(target_logits[i])`. Draft token
++    `j` sits at index `j + 1` and is accepted while every preceding row agrees;
++    the first disagreement ends the run and its argmax becomes the bonus token.
++    """
++    argmax = target_logits.float().argmax(dim=-1).tolist()
++    accepted = 0
++    for j, draft_token in enumerate(draft_tokens):
++        if argmax[j] != draft_token:
++            break
++        accepted += 1
++    # `argmax[accepted]` predicts the token after the last accepted one and is
++    # always in range because `accepted <= len(draft_tokens)`.
++    return VerifyRun(verified=draft_tokens[:accepted], bonus=int(argmax[accepted]))
++
++
++# ---------------------------------------------------------------------------
++# The draft model.
++#
++# Reusing `ModelRunner` for the draft would drag in the target's process group,
++# CUDA graphs and KV sizing, so the draft gets the minimal runner below: load
++# weights, warm up, size a small private KV cache from the memory the target
++# left free, and expose exactly what speculative decoding needs.
++
++
++class DraftModelRunner:
++    """Minimal eager runner for the draft model (no graphs, no sampling)."""
++
++    def __init__(self, config: dict, rank: int = 0):
++        from pathlib import Path
++
++        from myvllm.models.qwen3 import Qwen3ForCausalLM
++        from myvllm.utils.loader import load_weights_from_checkpoint, resolve_checkpoint_path
++
++        self.config = config
++        self.rank = rank
++        self.block_size = config["block_size"]
++        dtype_name = str(config.get("draft_dtype", config.get("dtype", "bfloat16")))
++        dtype_name = dtype_name.removeprefix("torch.")
++        self.dtype = {
++            "float16": torch.float16,
++            "bfloat16": torch.bfloat16,
++            "float32": torch.float32,
++        }[dtype_name]
++
++        model_config = config["speculative_draft_model_config"]
++        model_name = Path(model_config["model_name_or_path"]).name
++        if not model_name.startswith("Qwen3-"):
++            raise ValueError(
++                f"Unsupported draft model for speculation: {model_name}"
++            )
++        self.model = Qwen3ForCausalLM(
++            vocab_size=model_config["vocab_size"],
++            hidden_size=model_config["hidden_size"],
++            num_heads=model_config["num_heads"],
++            head_dim=model_config["head_dim"],
++            scale=model_config.get("scale", 1.0),
++            num_kv_heads=model_config["num_kv_heads"],
++            rms_norm_epsilon=model_config["rms_norm_epsilon"],
++            qkv_bias=model_config["qkv_bias"],
++            base=model_config["base"],
++            max_position=model_config["max_position"],
++            intermediate_size=model_config["intermediate_size"],
++            ffn_bias=model_config["ffn_bias"],
++            num_layers=model_config["num_layers"],
++            tie_word_embeddings=model_config["tie_word_embeddings"],
++            block_size=self.block_size,
++        )
++        self.model = self.model.to(device=f"cuda:{rank}", dtype=self.dtype)
++        checkpoint = model_config.get("checkpoint_path") or resolve_checkpoint_path(
++            model_config["model_name_or_path"]
++        )
++        load_weights_from_checkpoint(self.model, checkpoint)
++        self._allocate_kv_cache()
++        self.model.eval()
++
++    def _allocate_kv_cache(self) -> None:
++        """Small private KV pool for the draft model's own autoregressive run.
++
++        Sized from the memory the target left free and capped by
++        `draft_kv_blocks`, so a draft model can never starve the target.
++        """
++        free_mem, _ = torch.cuda.mem_get_info()
++        budget = int(free_mem * self.config.get("draft_gpu_memory_fraction", 0.25))
++        mc = self.config["speculative_draft_model_config"]
++        block_bytes = (
++            self.block_size * 2 * mc["num_layers"] * mc["num_kv_heads"]
++            * mc["head_dim"] * self.dtype.itemsize
++        )
++        # The draft pool is stateless across rounds (each row rewrites its own
++        # pair), so it only needs one block per concurrently drafted sequence.
++        # We ask for `draft_kv_blocks` but never exceed what the memory budget
++        # allows -- the budget is a ceiling, not the target.
++        wanted = max(1, int(self.config.get("draft_kv_blocks", 256)))
++        affordable = max(1, budget // block_bytes)
++        num_blocks = min(wanted, affordable) if budget > 0 else wanted
++        self.num_blocks = num_blocks
++        self.num_slots = num_blocks * self.block_size
++        self.kv_cache = torch.zeros(
++            2,
++            mc["num_layers"],
++            num_blocks,
++            self.block_size,
++            mc["num_kv_heads"],
++            mc["head_dim"],
++            device=f"cuda:{self.rank}",
++            dtype=self.dtype,
++        )
++        layer_id = 0
++        for module in self.model.modules():
++            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
++                module.k_cache = self.kv_cache[0, layer_id]
++                module.v_cache = self.kv_cache[1, layer_id]
++                layer_id += 1
++
++    # ------------------------------------------------------------------
++    # Contexts. A draft forward is a decode-shaped pass over one sequence per
++    # batch row, reading and writing only its own private slots.
++
++    def _row_block(self, row: int) -> int:
++        """Block that row `row` drafts into for one whole proposal round.
++
++        The draft extends one token at a time, so it is an ordinary
++        autoregressive decode *within its own block*: step `j` writes the j-th
++        slot of the row's block and attends over slots `0 .. j` of it. That
++        keeps positions increasing (so the draft conditions on what it already
++        wrote) and needs no KV writes outside the row's own block.
++        """
++        return row % self.num_blocks
++
++    @torch.inference_mode()
++    def propose(self, last_tokens: list[int], gamma: int) -> list[list[int]]:
++        """Propose `gamma` tokens per row (plain batched greedy drafting)."""
++        from myvllm.utils import get_context, set_context
++
++        num_seqs = len(last_tokens)
++        if num_seqs > self.config.get("max_num_sequences", 16):
++            raise ValueError("draft batch larger than max_num_sequences")
++        if num_seqs > self.num_blocks:
++            raise ValueError(
++                f"draft needs one KV block per batched sequence, but only "
++                f"{self.num_blocks} are available (batch = {num_seqs}); "
++                "raise draft_kv_blocks"
++            )
++        if gamma > self.num_blocks // max(1, self.config.get("max_num_sequences", 16)):
++            raise ValueError(
++                f"draft needs one KV block per step per sequence: gamma="
++                f"{gamma} with batch up to "
++                f"{self.config.get('max_num_sequences', 16)} needs more than "
++                f"{self.num_blocks} blocks; raise draft_kv_blocks"
++            )
++        proposals: list[list[int]] = [[] for _ in range(num_seqs)]
++        row_blocks = [self._row_block(row) for row in range(num_seqs)]
++        # The draft borrows the global context object, so whatever was there
++        # before must be restored afterwards -- the caller's normal decode
++        # context is still needed for the target verify pass that follows.
++        saved = get_context()
++        try:
++            # One spare slot per row holds the incoming token (`last_token`),
++            # which is the draft's only context: the draft model does not see
++            # the prompt, it only continues from the token the target last
++            # produced. Without writing it, the first proposal would attend an
++            # empty cache and be meaningless.
++            if gamma + 1 > self.block_size:
++                raise ValueError(
++                    f"gamma={gamma} needs {gamma + 1} slots per row but the "
++                    f"draft block_size is {self.block_size}; lower gamma or "
++                    "raise block_size"
++                )
++            # The draft is a plain autoregressive decoder over its own two-slot
++            # window. It runs as a *prefill-shaped* multi-token pass so that
++            # positions advance with the chain (`context_lens - 1` would pin
++            # every step to position 0, which degenerates the draft).
++            #
++            # Step `j`: the run's tokens so far are `[head, p0 .. p_{j-1}]`, and
++            # we ask for the distribution at the last of them. Slot `j` of the
++            # row's block holds that token, so `slot_mapping` names slot `j`
++            # while `cu_seqlens` spans `j + 1` tokens -- the pass then attends
++            # slots `0 .. j` and yields the next proposal.
++            if gamma + 1 > self.block_size:
++                raise ValueError(
++                    f"gamma={gamma} needs {gamma + 1} slots per row but the "
++                    f"draft block_size is {self.block_size}; lower gamma or "
++                    "raise block_size"
++                )
++            drafted: list[list[int]] = [[] for _ in range(num_seqs)]
++            # Re-feed the whole window each step: the draft's context is short
++            # (grow it by one token per step), and re-running it keeps the
++            # positions advancing without any cross-step cache bookkeeping.
++            window: list[list[int]] = [[tok] for tok in last_tokens]
++            for step in range(gamma):
++                flat: list[int] = []
++                slot_mapping: list[int] = []
++                for row, tokens in enumerate(window):
++                    block = row_blocks[row] * self.block_size
++                    for offset, _ in enumerate(tokens):
++                        flat.append(tokens[offset])
++                        slot_mapping.append(block + offset)
++                tokens_t = torch.tensor(flat, dtype=torch.long, device="cuda")
++                widths = [len(t) for t in window]
++                cu_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device="cuda")
++                cu_q[1:] = torch.tensor(
++                    widths, dtype=torch.int32, device="cuda"
++                ).cumsum(0)
++                set_context(
++                    is_prefill=True,
++                    cu_seqlens_q=cu_q,
++                    cu_seqlens_k=cu_q.clone(),
++                    max_seqlen_q=max(widths),
++                    max_seqlen_k=max(widths),
++                    slot_mapping=torch.tensor(
++                        slot_mapping, dtype=torch.long, device="cuda"
++                    ),
++                    context_lens=None,
++                    block_tables=torch.tensor(
++                        [[b] for b in row_blocks],
++                        dtype=torch.int32,
++                        device="cuda",
++                    ),
++                )
++                hidden = self.model(tokens_t)
++                logits = self.model.compute_logits(hidden)
++                nxt = logits.float().argmax(dim=-1).tolist()
++                for row in range(num_seqs):
++                    token = int(nxt[row])
++                    drafted[row].append(token)
++                    window[row].append(token)
++            proposals = drafted
++        finally:
++            _restore_context(saved)
++        return proposals
++
++    @torch.inference_mode()
++    def run_verify(self, input_ids: torch.Tensor) -> torch.Tensor:
++        hidden = self.model(input_ids)
++        return self.model.compute_logits(hidden)
++
++    def call(self, method_name: str, *args):
++        """Mirror `ModelRunner.call` so a TP target can broadcast to workers."""
++        method = getattr(self, method_name, None)
++        if method is None:
++            raise ValueError(f"Unknown draft method: {method_name}")
++        return method(*args)
++
++
++def spec_decode_config(config: dict) -> dict | None:
++    """Read the speculative-decoding knobs from the engine config."""
++    if not config.get("speculative", False):
++        return None
++    if not config.get("speculative_draft_model_config"):
++        raise ValueError(
++            "speculative decoding requires 'speculative_draft_model_config'"
++        )
++    gamma = int(config.get("speculative_gamma", 5))
++    if gamma < 1:
++        raise ValueError("speculative_gamma must be at least 1")
++    return {"gamma": gamma}
++
++
++__all__ = [
++    "DraftModelRunner",
++    "SamplingParams",
++    "Sequence",
++    "SpeculativeStats",
++    "VerifyRun",
++    "spec_decode_config",
++    "verify_run",
++]
+diff --git a/src/myvllm/models/qwen3.py b/src/myvllm/models/qwen3.py
+index 7e7b5b9..11d3e34 100644
+--- a/src/myvllm/models/qwen3.py
++++ b/src/myvllm/models/qwen3.py
+@@ -372,6 +372,16 @@ class Qwen3ForCausalLM(nn.Module):
+         logits = self.lm_head(hidden_states)
+         return logits
+ 
++    def compute_logits_all_rows(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Logits for EVERY row, bypassing the prefill last-token selection.
++
++        `compute_logits` returns one row per sequence because speculating on a
++        normal prefill only wants the last token's distribution. Verification
++        needs every position's distribution, so it projects the hidden states
++        directly instead.
++        """
++        return torch.nn.functional.linear(hidden_states, self.lm_head.weight)
++
+ if __name__ == "__main__":
+     model = Qwen3ForCausalLM(
+         vocab_size=50257,
+diff --git a/tests/benchmarks/benchmark_speculative.py b/tests/benchmarks/benchmark_speculative.py
+new file mode 100644
+index 0000000..791a99c
+--- /dev/null
++++ b/tests/benchmarks/benchmark_speculative.py
+@@ -0,0 +1,296 @@
++"""Benchmark: baseline decode vs. draft-model speculative decode.
++
++Both runs use the same target model, the same prompts and the same sampling
++settings; only `speculative` changes. The script reports wall-clock throughput
++(tok/s), per-token latency, and the speculative counters (acceptance rate,
++target forwards per emitted token) so the speedup can be read off directly
++rather than taken on faith.
++
++Run:
++    uv run python tests/benchmarks/benchmark_speculative.py
++    uv run python tests/benchmarks/benchmark_speculative.py --gamma 3 --max-tokens 256
++"""
++
++import argparse
++import gc
++import json
++import os
++import sys
++import time
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
++
++import torch
++from transformers import AutoTokenizer
++
++from myvllm.engine.llm_engine import LLMEngine
++from myvllm.sampling_parameters import SamplingParams
++
++# Defaults are the intended 2-GPU setup (1.7B target, 0.6B draft). On a small
++# card, pass --target / --draft the same small model to exercise the full
++# speculative path (the accept rule is exact, so self-speculation still has to
++# reproduce baseline output token for token).
++TARGET_MODEL = "Qwen/Qwen3-1.7B"
++DRAFT_MODEL = "Qwen/Qwen3-0.6B"
++
++# Greedy (temperature -> 0 is rejected by SamplingParams, so use the smallest
++# legal value) is what the accept rule implements exactly.
++TEMPERATURE = 1e-5
++_GPU_MEM = 0.55
++
++PROMPTS = [
++    "Write a Python function that merges two sorted lists into one sorted list, then explain its time complexity.",
++    "Explain how a paged KV cache works in an LLM inference engine, step by step.",
++    "List the prime numbers below 100 and say how many there are.",
++    "Summarise the causes of the Industrial Revolution in five paragraphs.",
++]
++
++
++def build_config(draft_cfg: dict, gamma: int, model: str = TARGET_MODEL, target_shape=None) -> dict:
++    """Target config; the draft model's own config sits nested inside it.
++
++    Keeping the draft's shape in its own sub-dict is what lets one engine
++    config describe two models of different sizes without key collisions.
++    """
++    config = {
++        "max_num_sequences": 8,
++        "max_num_batched_tokens": 1024,
++        "max_cached_blocks": 512,
++        "block_size": 128,
++        "world_size": 1,
++        "model_name_or_path": model,
++        "enforce_eager": True,
++        "dtype": "bfloat16",
++        "vocab_size": 151936,
++        **(target_shape or {"hidden_size": 2048, "num_heads": 16, "head_dim": 128,
++                            "num_kv_heads": 8, "intermediate_size": 6144}),
++        "num_layers": 28,
++        "tie_word_embeddings": True,
++        "base": 1000000,
++        "rms_norm_epsilon": 1e-6,
++        "qkv_bias": False,
++        "scale": 1,
++        "max_position": 32768,
++        "ffn_bias": False,
++        "max_model_length": 2048,
++        "gpu_memory_utilization": _GPU_MEM,
++        "eos": 151645,
++        # Speculative-decoding knobs. `speculative=False` reproduces the
++        # baseline exactly, so the two arms differ in one key only.
++        "speculative": False,
++        "speculative_gamma": gamma,
++        "draft_kv_blocks": 64,
++        "draft_gpu_memory_fraction": 0.15,
++    }
++    if draft_cfg is not None:
++        config["speculative"] = True
++        config["speculative_draft_model_config"] = draft_cfg
++    return config
++
++
++# Keyed by the checkpoint's directory basename, so a local path such as
++# `/models/Qwen3-0.6B` resolves the same way a Hub repo id does.
++TARGET_SHAPES = {
++    "Qwen3-0.6B": {
++        "hidden_size": 1024, "num_heads": 16, "head_dim": 128,
++        "num_kv_heads": 8, "intermediate_size": 3072,
++    },
++    "Qwen3-1.7B": {
++        "hidden_size": 2048, "num_heads": 16, "head_dim": 128,
++        "num_kv_heads": 8, "intermediate_size": 6144,
++    },
++}
++
++
++def shape_for(model: str) -> dict:
++    """Look up a model's shape by basename, so local paths work too."""
++    from pathlib import Path
++
++    shapes = TARGET_SHAPES.get(Path(model).name) or TARGET_SHAPES.get(model)
++    if shapes is None:
++        raise ValueError(
++            f"No shape entry for {model}; add it to TARGET_SHAPES "
++            f"(known: {sorted(TARGET_SHAPES)})"
++        )
++    return shapes
++
++
++def draft_config_for(model: str) -> dict:
++    """Shape map for the draft model, keyed by the model it names."""
++    shapes = shape_for(model)
++    return {"model_name_or_path": model, "vocab_size": 151936, **shapes,
++            "num_layers": 28,
++            "tie_word_embeddings": True, "base": 1000000,
++            "rms_norm_epsilon": 1e-6, "qkv_bias": False, "scale": 1.0,
++            "max_position": 32768, "ffn_bias": False}
++
++
++DRAFT_CFG_QWEN3_06B = {
++    "model_name_or_path": DRAFT_MODEL,
++    "vocab_size": 151936,
++    "hidden_size": 1024,
++    "num_heads": 16,
++    "head_dim": 128,
++    "num_kv_heads": 8,
++    "intermediate_size": 3072,
++    "num_layers": 28,
++    "tie_word_embeddings": True,
++    "base": 1000000,
++    "rms_norm_epsilon": 1e-6,
++    "qkv_bias": False,
++    "scale": 1.0,
++    "max_position": 32768,
++    "ffn_bias": False,
++}
++
++
++def run_arm(name: str, config: dict, tokenizer, prompts, max_tokens, warmup, repeats):
++    """Run one arm: `warmup` unmeasured generations, then `repeats` measured."""
++    llm = LLMEngine(config=config)
++    sampling = SamplingParams(
++        temperature=TEMPERATURE,
++        max_tokens=max_tokens,
++        max_model_length=config["max_model_length"],
++        ignore_eos=True,
++    )
++    try:
++        for _ in range(warmup):
++            llm.generate(prompts, sampling)
++            torch.cuda.synchronize()
++
++        times, token_counts, spec_stats = [], [], []
++        for _ in range(repeats):
++            torch.cuda.synchronize()
++            start = time.perf_counter()
++            out = llm.generate(prompts, sampling)
++            torch.cuda.synchronize()
++            times.append(time.perf_counter() - start)
++            token_counts.append(sum(len(t) for t in out["token_ids"]))
++            stats = llm.get_speculative_stats()
++            if stats is not None:
++                spec_stats.append(stats)
++
++        best = min(times)
++        tokens = max(token_counts)
++        result = {
++            "name": name,
++            "latency_s": best,
++            "tokens": tokens,
++            "tokens_per_s": tokens / best,
++            "latency_per_token_ms": best / tokens * 1000.0,
++        }
++        if spec_stats:
++            merged = spec_stats[-1]
++            for key in ("rounds", "draft_tokens", "accepted_tokens", "target_forwards"):
++                merged[key] = sum(s[key] for s in spec_stats)
++            merged["acceptance_rate"] = (
++                merged["accepted_tokens"] / merged["draft_tokens"]
++                if merged["draft_tokens"]
++                else 0.0
++            )
++            merged["mean_accepted_per_round"] = (
++                merged["accepted_tokens"] / merged["rounds"] if merged["rounds"] else 0.0
++            )
++            result["speculative"] = merged
++        return result
++    finally:
++        # Two engines cannot coexist on a small card: the baseline's KV cache
++        # must be gone before the speculative arm allocates its own.
++        llm.exit()
++        del llm
++        gc.collect()
++        torch.cuda.empty_cache()
++        torch.cuda.synchronize()
++
++
++def main():
++    global TARGET_MODEL, DRAFT_MODEL, _GPU_MEM
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--max-tokens", type=int, default=128)
++    parser.add_argument("--gamma", type=int, default=5)
++    parser.add_argument("--warmup", type=int, default=1)
++    parser.add_argument("--repeats", type=int, default=3)
++    parser.add_argument("--out", default="tests/benchmarks/benchmark_speculative.json")
++    parser.add_argument("--target", default=TARGET_MODEL)
++    parser.add_argument("--draft", default=DRAFT_MODEL)
++    parser.add_argument("--gpu-mem", type=float, default=0.55)
++    args = parser.parse_args()
++
++    TARGET_MODEL, DRAFT_MODEL = args.target, args.draft
++    _GPU_MEM = args.gpu_mem
++
++    tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL)
++    prompts = [
++        tokenizer.apply_chat_template(
++            [{"role": "user", "content": p}],
++            tokenize=False,
++            add_generation_prompt=True,
++        )
++        for p in PROMPTS
++    ]
++
++    print("=== baseline (no speculation) ===")
++    baseline = run_arm(
++        "baseline",
++        build_config(None, args.gamma, args.target, shape_for(args.target)),
++        tokenizer,
++        prompts,
++        args.max_tokens,
++        args.warmup,
++        args.repeats,
++    )
++    print(json.dumps(baseline, indent=2))
++
++    print(f"=== speculative (gamma={args.gamma}, draft={DRAFT_MODEL}) ===")
++    spec = run_arm(
++        "speculative",
++        build_config(
++            draft_config_for(args.draft), args.gamma, args.target,
++            shape_for(args.target),
++        ),
++        tokenizer,
++        prompts,
++        args.max_tokens,
++        args.warmup,
++        args.repeats,
++    )
++    print(json.dumps(spec, indent=2))
++
++    speedup = spec["tokens_per_s"] / baseline["tokens_per_s"]
++    report = {
++        "target_model": TARGET_MODEL,
++        "draft_model": DRAFT_MODEL,
++        "gamma": args.gamma,
++        "max_tokens": args.max_tokens,
++        "num_prompts": len(prompts),
++        "temperature": TEMPERATURE,
++        "baseline": baseline,
++        "speculative": spec,
++        "speedup_tokens_per_s": speedup,
++        "baseline_latency_per_token_ms": baseline["latency_per_token_ms"],
++        "speculative_latency_per_token_ms": spec["latency_per_token_ms"],
++    }
++    print("\n=== summary ===")
++    print(f"baseline    {baseline['tokens_per_s']:.2f} tok/s")
++    print(f"speculative {spec['tokens_per_s']:.2f} tok/s  ({speedup:.2f}x)")
++    if "speculative" in spec:
++        s = spec["speculative"]
++        print(
++            f"acceptance rate {s['acceptance_rate']:.3f}, "
++            f"mean accepted/round {s['mean_accepted_per_round']:.2f}, "
++            f"target forwards {s['target_forwards']}"
++        )
++
++    out_path = Path(args.out)
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    with open(out_path, "w") as fh:
++        json.dump(report, fh, indent=2)
++    print(f"wrote {out_path}")
++
++    return report
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_speculative.py b/tests/test_speculative.py
+new file mode 100644
+index 0000000..89d4840
+--- /dev/null
++++ b/tests/test_speculative.py
+@@ -0,0 +1,208 @@
++"""Correctness tests for draft-model speculative decoding.
++
++`verify_run` is pure logic and runs on CPU, so it is tested exhaustively there.
++`test_greedy_equivalence_*` need a GPU and one small model: because the accept
++rule is exact for greedy decoding, a chain of speculative rounds must reproduce
++the baseline's tokens **exactly**, whatever the draft model's quality.
++
++Run:
++    uv run python tests/test_speculative.py            # logic only
++    uv run python tests/test_speculative.py --gpu      # + engine equivalence
++"""
++
++import argparse
++import sys
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
++
++from myvllm.engine.speculative import SpeculativeStats, verify_run  # noqa: E402
++
++VOCAB = 128
++
++
++def _logits(rows, vocab=VOCAB):
++    """Logits whose argmax at row `i` is `rows[i]`."""
++    out = torch.full((len(rows), vocab), -5.0)
++    for i, token in enumerate(rows):
++        out[i, token] = 5.0
++    return out
++
++
++def test_accept_rule_basics():
++    # All drafts accepted; bonus comes from the row after the last draft.
++    run = verify_run(_logits([1, 2, 3, 4]), [1, 2, 3])
++    assert run.verified == [1, 2, 3] and run.bonus == 4, run
++
++    # First draft rejected: nothing accepted, but a bonus token still lands.
++    run = verify_run(_logits([9, 2, 3, 4]), [1, 2, 3])
++    assert run.verified == [] and run.bonus == 9, run
++
++    # Partial acceptance stops at the first disagreement.
++    run = verify_run(_logits([1, 2, 7, 4]), [1, 2, 3])
++    assert run.verified == [1, 2] and run.bonus == 7, run
++
++    # gamma = 1 works in both directions.
++    assert verify_run(_logits([5, 6]), [5]).verified == [5]
++    assert verify_run(_logits([5, 6]), [9]).verified == []
++
++
++def test_accept_rule_matches_longest_common_prefix():
++    """The accept rule IS "longest common prefix of drafts and target argmax"."""
++    torch.manual_seed(0)
++    for _ in range(3000):
++        rows = torch.randint(0, VOCAB, (6,)).tolist()
++        logits = _logits(rows)
++        drafts = [
++            rows[j] if torch.rand(1).item() < 0.7 else int(torch.randint(VOCAB, (1,)))
++            for j in range(5)
++        ]
++        run = verify_run(logits, drafts)
++        expected = 0
++        for j in range(5):
++            if drafts[j] != rows[j]:
++                break
++            expected += 1
++        assert run.accepted == expected, (drafts, rows, run)
++        assert run.bonus == rows[expected], (drafts, rows, run)
++
++
++def test_stats_ratios():
++    stats = SpeculativeStats(
++        rounds=4, draft_tokens=16, accepted_tokens=8,
++        target_forwards=4, tokens_emitted=12,
++    )
++    assert abs(stats.acceptance_rate - 0.5) < 1e-9
++    assert abs(stats.mean_accepted_per_round - 2.0) < 1e-9
++    assert abs(stats.target_forwards_per_token - 4 / 12) < 1e-9
++    empty = SpeculativeStats()
++    assert empty.acceptance_rate == 0.0 and empty.target_forwards_per_token == 0.0
++
++
++def test_bookkeeping_append_truncate_bonus():
++    """Append a run, accept a prefix, and check tokens and blocks line up."""
++    from myvllm.engine.block_manager import BlockManager
++    from myvllm.engine.sequence import Sequence
++
++    block_size = 8
++    bm = BlockManager(num_blocks=16, block_size=block_size)
++    seq = Sequence(token_ids=list(range(10)), block_size=block_size)
++    bm.allocate(seq)
++
++    drafts = [20, 21, 22]
++    for token in drafts:
++        seq.append_token(token)
++        bm.append(seq)
++
++    # Target: agrees with 20 and 21, disagrees on the third proposal.
++    run = verify_run(_logits([20, 21, 99, 98], vocab=128), drafts)
++    assert run.accepted == 2 and run.bonus == 99, run
++
++    drop = len(drafts) - run.accepted
++    if drop:
++        del seq.token_ids[-drop:]
++        seq.num_tokens -= drop
++        seq.last_token = seq.token_ids[-1]
++        while len(seq.block_table) > seq.num_blocks:
++            block_id = seq.block_table.pop()
++            block = bm.blocks[block_id]
++            if block.ref_count > 0:
++                block.ref_count -= 1
++            if block.ref_count == 0:
++                bm.used_block_ids.discard(block_id)
++                if block_id not in bm.free_block_ids:
++                    bm.free_block_ids.append(block_id)
++    seq.append_token(run.bonus)
++    bm.append(seq)
++
++    assert seq.token_ids == list(range(10)) + [20, 21, 99], seq.token_ids
++    assert seq.last_token == 99
++    assert len(seq.block_table) >= seq.num_blocks
++
++
++def test_greedy_equivalence_engine(model: str, gamma: int, max_tokens: int = 32):
++    """Speculative decoding must reproduce baseline tokens exactly."""
++    from transformers import AutoTokenizer
++
++    from myvllm.engine.llm_engine import LLMEngine
++    from myvllm.sampling_parameters import SamplingParams
++
++    shape = {
++        "hidden_size": 1024, "num_heads": 16, "head_dim": 128,
++        "num_kv_heads": 8, "intermediate_size": 3072,
++    }
++    base = {
++        "max_num_sequences": 8, "max_num_batched_tokens": 512,
++        "max_cached_blocks": 256, "block_size": 128, "world_size": 1,
++        "model_name_or_path": model, "enforce_eager": True, "dtype": "bfloat16",
++        "vocab_size": 151936, **shape, "num_layers": 28,
++        "tie_word_embeddings": True, "base": 1000000, "rms_norm_epsilon": 1e-6,
++        "qkv_bias": False, "scale": 1, "max_position": 32768, "ffn_bias": False,
++        "max_model_length": 256, "gpu_memory_utilization": 0.7, "eos": 151645,
++    }
++    draft = {"model_name_or_path": model, "vocab_size": 151936, **shape,
++             "num_layers": 28, "tie_word_embeddings": True, "base": 1000000,
++             "rms_norm_epsilon": 1e-6, "qkv_bias": False, "scale": 1.0,
++             "max_position": 32768, "ffn_bias": False}
++
++    tokenizer = AutoTokenizer.from_pretrained(model)
++    prompts = [
++        tokenizer.apply_chat_template(
++            [{"role": "user", "content": "list all prime numbers within 100"}],
++            tokenize=False, add_generation_prompt=True,
++        )
++    ]
++    sampling = SamplingParams(
++        temperature=1e-5, max_tokens=max_tokens, max_model_length=256,
++        ignore_eos=True,
++    )
++
++    def run(config):
++        import gc
++        engine = LLMEngine(config=config)
++        ids = [list(t) for t in engine.generate(prompts, sampling)["token_ids"]]
++        stats = engine.get_speculative_stats()
++        engine.exit()
++        del engine
++        gc.collect()
++        torch.cuda.empty_cache()
++        torch.cuda.synchronize()
++        return ids, stats
++
++    baseline, _ = run({**base, "speculative": False})
++    spec, stats = run(
++        {**base, "speculative": True, "speculative_gamma": gamma,
++         "speculative_draft_model_config": draft, "draft_kv_blocks": 32}
++    )
++    assert baseline == spec, (baseline, spec)
++    print(f"  equivalence OK at gamma={gamma}; stats={stats}")
++    return stats
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gpu", action="store_true", help="also run engine tests")
++    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
++    parser.add_argument("--gamma", type=int, default=4)
++    args = parser.parse_args()
++
++    test_accept_rule_basics()
++    print("accept-rule basics OK")
++    test_accept_rule_matches_longest_common_prefix()
++    print("accept-rule equivalence vs longest-common-prefix OK")
++    test_stats_ratios()
++    print("stats ratios OK")
++    test_bookkeeping_append_truncate_bonus()
++    print("append/truncate/bonus bookkeeping OK")
++
++    if args.gpu:
++        test_greedy_equivalence_engine(args.model, args.gamma)
++        print("greedy equivalence (engine) OK")
++    else:
++        print("(skipped GPU equivalence; pass --gpu to run it)")
++
++
++if __name__ == "__main__":
++    main()
